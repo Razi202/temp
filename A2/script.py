@@ -6,55 +6,76 @@ import queue
 import threading
 import pika
 
-def serviceA(A, B, num_iters, q_i, q_s):
+def serviceA(A, B, num_iters, event1, event2):
     #Establish the pika connection
     connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
     channel = connection.channel()
-    
+    q_i = channel.queue_declare(queue='qA')
+    q_s = channel.queue_declare(queue='qB')
     
     #Multiply the two constants
     X = A * B
     #Run the loop till the required number of iterations.
     for i in range(num_iters):
-        #calculate the value of X and pass it to the "square" function by placing the value in its queue.
-        q_s.put(X)
+        #calculate the value of X and pass it to the "service B" function by placing the value in its queue.
+        channel.basic_publish(exchange='', routing_key='qA', body=str(X))
         print(f"Value of X in service A process:{X}\n")
-        #Get the updated value of 'X' from the increment queue
-        X = q_i.get()
-    #Sending a signol for termiation to the square function.
-    #This was done because queue.empty() was logically incorrect.
-    q_s.put("terminate")
+        #servie B may start
+        event1.set()
+
+        #wait for service B's response
+        event2.wait()
+        event2.clear()
+
+        #Get the updated value of 'X' from the service B queue
+        _, _, X = channel.basic_get(queue='qB')
+        #perform the second operation: X = X * B
+        X = int(X) * B
+
+    channel.queue_delete(queue="qA")
+    channel.queue_delete(queue="qB")
     connection.close()
     
-def serviceB(B, q_i, q_s):
+def serviceB(B, event1, event2):
     connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
     channel = connection.channel()
+    q_i = channel.queue_declare(queue='qA')
+    q_s = channel.queue_declare(queue='qB')
     while True:
-        #This will return us the oldest value (FCFS) in the queue and store it in X
-        X = q_s.get()
-        #We have to check if the first thread sent a message to terminate the code or not.
-        #Note: We cannot use queue.empty() and terminate the code because the other thread might make some changes to it
-        #without the current thread realizing.
-        if X == "terminate":
-            break
-        X = X * B
+        event1.wait()
+        event1.clear()
+        #Get the value from service A
+        _, _, X = channel.basic_get(queue='qA')
+        #Square the value extracted from service A
+        X = int(X) ** 2
         print(f"Value of X in service B process: {X}\n")
-        #Now we send the value 'X' back to the increment function using its queue
-        q_i.put(X)
+        #Now we send the value 'X' back to service A using its queue
+        channel.basic_publish(exchange='', routing_key='qB', body=str(X))
+        #service A may continue
+        event2.set()
+        event1.set()
+
+    channel.queue_delete(queue="qA")
+    channel.queue_delete(queue="qB")
     connection.close()
         
 #A queue for the increment function
-q_i = mp.Queue()
-#A queue for the square function
-q_s = mp.Queue()
+# q_i = mp.Queue()
+# #A queue for the square function
+# q_s = mp.Queue()
+
 if __name__ == "__main__":
     
+    event1 = mp.Event()
+    event2 = mp.Event()
+
     num_iters = int(input("Enter the number of iterations you want to perform:"))
-    incr_thread = mp.Process(target=serviceA, args=(2, 6, num_iters, q_i, q_s))
-    square_thread = mp.Process(target=serviceB, args=(6, q_i, q_s,))
+    incr_thread = mp.Process(target=serviceA, args=(2, 6, num_iters, event1, event2,))
+    square_thread = mp.Process(target=serviceB, args=(6, event1, event2,))
 
     incr_thread.start()
     square_thread.start()
 
+    event1.set()
     incr_thread.join()
     square_thread.join()
